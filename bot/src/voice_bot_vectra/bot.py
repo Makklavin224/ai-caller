@@ -7,6 +7,10 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -30,8 +34,6 @@ async def run_bot(
         audio_out_enabled=True,
         audio_in_sample_rate=16000,
         audio_out_sample_rate=16000,
-        vad_analyzer=SileroVADAnalyzer(),
-        vad_audio_passthrough=True,
     )
     transport = AudioSocketTransport(reader, writer, params)
 
@@ -71,7 +73,12 @@ async def run_bot(
         {"role": "assistant", "content": FIRST_MESSAGE},
     ]
     context = LLMContext(messages=messages)
-    context_aggregator = llm.create_context_aggregator(context)
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
 
     pipeline = Pipeline([
         transport.input(),
