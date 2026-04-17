@@ -92,7 +92,7 @@ async def run_bot(
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
+            allow_interruptions=False,
             enable_metrics=False,
         ),
     )
