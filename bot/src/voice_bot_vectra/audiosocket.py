@@ -15,7 +15,7 @@ import audioop
 import struct
 
 from loguru import logger
-from pipecat.frames.frames import CancelFrame, EndFrame, InputAudioRawFrame, StartFrame
+from pipecat.frames.frames import CancelFrame, EndFrame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
