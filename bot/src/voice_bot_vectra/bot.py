@@ -52,6 +52,7 @@ async def run_bot(
         settings=OpenAILLMService.Settings(
             model=cfg.openai_model,
             temperature=0.1,
+            system_instruction=SYSTEM_PROMPT,
         ),
     )
 
@@ -68,12 +69,10 @@ async def run_bot(
         ),
     )
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "assistant", "content": FIRST_MESSAGE},
-    ]
-    context = LLMContext(messages=messages)
-    context_aggregator = LLMContextAggregatorPair(
+    context = LLMContext(
+        messages=[{"role": "assistant", "content": FIRST_MESSAGE}],
+    )
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
@@ -83,11 +82,11 @@ async def run_bot(
     pipeline = Pipeline([
         transport.input(),
         stt,
-        context_aggregator.user(),
+        user_aggregator,
         llm,
         tts,
         transport.output(),
-        context_aggregator.assistant(),
+        assistant_aggregator,
     ])
 
     task = PipelineTask(
