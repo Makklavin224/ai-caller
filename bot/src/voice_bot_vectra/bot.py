@@ -6,7 +6,7 @@ from pipecat.frames.frames import EndFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs import ElevenLabsTTSService
 from pipecat.services.openai import OpenAILLMService
@@ -70,7 +70,7 @@ async def run_bot(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "assistant", "content": FIRST_MESSAGE},
     ]
-    context = OpenAILLMContext(messages)
+    context = LLMContext(messages=messages)
     context_aggregator = llm.create_context_aggregator(context)
 
     pipeline = Pipeline([
