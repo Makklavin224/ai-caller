@@ -1,14 +1,18 @@
 ================================================================================
-  voice-bot-vectra — INSTALL (Ubuntu 22.04 → первый звонок)
+  voice-bot-vectra — INSTALL на РФ VPS (Ubuntu 22.04)
+  Всё в одном compose + HTTP-прокси для внешних API
 ================================================================================
 
-Что разворачиваем:
-  - Asterisk 20 в Docker, регистрируется на SIP-транке UIS
-  - Python-бот на Pipecat 1.0: Deepgram STT (ru) → OpenAI LLM → ElevenLabs TTS
-  - Между Asterisk и ботом — AudioSocket (TCP :4444, slin8 → ресемпл до 16 кГц)
-  - Промпт — Анна из экспорта Retell (sандвич-панели "ВЕктра")
+Архитектура (после уроков первой итерации):
+  - VPS ОБЯЗАТЕЛЬНО в РФ. UIS режет SIP-исходящие с не-РФ IP
+    ("Регион ВН запрещает использование SIP").
+  - Asterisk 18 (Ubuntu 22.04 контейнер) регается на UIS напрямую.
+  - Pipecat-бот (Python 3.12 + Pipecat 1.0) ходит в OpenAI / ElevenLabs /
+    Deepgram через HTTP-прокси в зарубежной локации (иначе эти API недоступны
+    с РФ IP). Прокси должен поддерживать метод CONNECT (для HTTPS/WSS).
+  - Аудио Asterisk ↔ Bot: AudioSocket TCP 127.0.0.1:4444 (host network).
 
-Тулы сверены по:
+Сверено по документации:
   - https://docs.asterisk.org/Latest_API/API_Documentation/Dialplan_Applications/AudioSocket/
   - https://docs.pipecat.ai/server/services/llm/openai
   - https://docs.pipecat.ai/server/services/tts/elevenlabs
@@ -16,42 +20,49 @@
   - https://elevenlabs.io/docs/api-reference/text-to-speech/convert
 
 ================================================================================
-  ШАГ 0. Перед началом — что нужно собрать на руках
+  ШАГ 0. Пререквизиты (собери перед стартом)
 ================================================================================
 
-1. VPS Ubuntu 22.04 с публичным IP (минимум 2 vCPU / 2 ГБ RAM / 20 ГБ диска).
-   Фаервол: открыть 22/tcp (SSH), 5060/udp (SIP), 10000-10100/udp (RTP).
+1. РФ VPS Ubuntu 22.04. Провайдеры (любой):
+     - Selectel  (selectel.ru)
+     - Timeweb   (timeweb.cloud)
+     - Beget     (beget.com)
+     - FirstByte (firstbyte.ru)
+   Конфиг: 2 vCPU / 2 GB RAM / 20 GB SSD — с запасом.
+   IP должен быть публичный РФ.
 
-2. SIP-аккаунт UIS:
-   UIS_SIP_HOST      (обычно sip.uiscom.ru)
-   UIS_SIP_USER
-   UIS_SIP_PASSWORD
-   UIS_CALLER_ID     (номер, с которого звоним; без плюса, напр. 74951234567)
+2. Открытые порты на фаерволе провайдера (если он есть):
+     22/tcp       SSH
+     5060/udp     SIP
+     10000-10100/udp  RTP (аудио)
 
-3. API-ключи:
-   OPENAI_API_KEY      — https://platform.openai.com/api-keys
-   ELEVENLABS_API_KEY  — https://elevenlabs.io/app/settings/api-keys
-   ELEVENLABS_VOICE_ID — https://elevenlabs.io/app/voices (после клонирования)
-   DEEPGRAM_API_KEY    — https://console.deepgram.com ($200 бесплатно)
+3. SIP-аккаунт UIS (из ЛК → Интеграции → SIP):
+     UIS_SIP_HOST     (обычно pbx.uiscom.ru)
+     UIS_SIP_USER     (SIP-логин, напр. 0575771)
+     UIS_SIP_PASSWORD
+     UIS_CALLER_ID    (номер из ЛК UIS, без плюса, напр. 74951234567)
 
-4. Доступ к api.openai.com и api.elevenlabs.io с VPS.
-   Если VPS в РФ — нужен VPN на сервере ИЛИ прокси (proxyapi.ru / vsegpt.ru),
-   тогда в .env ставим OPENAI_BASE_URL=https://api.proxyapi.ru/openai/v1.
+4. API-ключи:
+     OPENAI_API_KEY       https://platform.openai.com/api-keys
+     ELEVENLABS_API_KEY   https://elevenlabs.io/app/settings/api-keys
+     ELEVENLABS_VOICE_ID  https://elevenlabs.io/app/voices (после клонирования)
+     DEEPGRAM_API_KEY     https://console.deepgram.com  ($200 бесплатно)
+
+5. HTTP-прокси в зарубежной локации:
+     URL формата: http://USER:PASS@HOST:PORT
+     Должен поддерживать CONNECT для портов 443.
 
 ================================================================================
-  ШАГ 1. Обновление Ubuntu 22.04 и базовые тулзы
+  ШАГ 1. Обновление Ubuntu + инструменты + фаервол
 ================================================================================
 
-# Зайти по SSH от root (или sudo su -)
-ssh root@YOUR_VPS_IP
+ssh root@YOUR_RF_VPS_IP
 
 apt update && apt upgrade -y
-apt install -y curl git ufw vim jq tcpdump ca-certificates
+apt install -y curl git make vim tcpdump ca-certificates ufw jq
 
-# Часовой пояс — важно для логов
 timedatectl set-timezone Europe/Moscow
 
-# Фаервол
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
@@ -61,147 +72,199 @@ ufw --force enable
 ufw status
 
 ================================================================================
-  ШАГ 2. Установка Docker + Compose
+  ШАГ 2. Docker + Compose plugin
 ================================================================================
 
 curl -fsSL https://get.docker.com | sh
 systemctl enable --now docker
-docker --version
-docker compose version       # плагин compose v2 идёт в комплекте
+docker --version               # >= 24.x
+docker compose version         # v2.x
 
 ================================================================================
-  ШАГ 3. (опционально) Прокси/VPN для OpenAI + ElevenLabs
-================================================================================
-
-Вариант А — проще: зарегаться на https://proxyapi.ru, получить ключ,
-в .env выставить:
-  OPENAI_BASE_URL=https://api.proxyapi.ru/openai/v1
-  OPENAI_API_KEY=<proxyapi-key>
-ElevenLabs — либо свой прокси, либо запускать Asterisk+бот через WireGuard.
-
-Вариант Б — WireGuard клиент на VPS, вся исходящая через VPN.
-Ставим wg-easy либо ручками wg-quick. Любой провайдер, где серверы вне РФ.
-В этой инструкции детали не расписываю — дефолтная настройка WG/любого OpenVPN.
-
-Вариант В — VPS уже вне РФ. Ничего настраивать не надо.
-
-================================================================================
-  ШАГ 4. Получение кода и конфиг .env
+  ШАГ 3. Клонируем репозиторий
 ================================================================================
 
 cd /opt
 git clone https://github.com/Makklavin224/ai-caller.git voice-bot-vectra
 cd voice-bot-vectra
-
 cp .env.example .env
-nano .env                    # заполнить все переменные из ШАГА 0
 
-# Проверь, что пустых обязательных значений нет
-grep -E "^[A-Z_]+=$" .env    # должно быть пусто
+================================================================================
+  ШАГ 4. Заполняем .env
+================================================================================
+
+nano /opt/voice-bot-vectra/.env
+
+Минимум для запуска — заполнить ВСЕ поля ниже:
+
+  # === HTTP-прокси (критично для работы внешних API из РФ!) ===
+  HTTPS_PROXY=http://USER:PASS@HOST:PORT
+  HTTP_PROXY=http://USER:PASS@HOST:PORT
+  NO_PROXY=localhost,127.0.0.1
+
+  # === UIS SIP ===
+  UIS_SIP_HOST=pbx.uiscom.ru
+  UIS_SIP_USER=<твой-SIP-логин>
+  UIS_SIP_PASSWORD=<пароль>
+  UIS_CALLER_ID=<номер-из-UIS-без-плюса>
+
+  # === OpenAI ===
+  OPENAI_API_KEY=sk-...
+  OPENAI_BASE_URL=https://api.openai.com/v1
+  OPENAI_MODEL=gpt-4.1-mini
+
+  # === ElevenLabs ===
+  ELEVENLABS_API_KEY=sk_...
+  ELEVENLABS_VOICE_ID=<voice-id-из-ElevenLabs>
+  ELEVENLABS_MODEL=eleven_multilingual_v2
+
+  # === Deepgram ===
+  DEEPGRAM_API_KEY=...
+
+Проверка, что ничего не забыто:
+  grep -E "^[A-Z_]+=$" .env
+  (строк быть не должно; если есть — заполни недостающие)
 
 ================================================================================
   ШАГ 5. Сборка образов
 ================================================================================
 
-docker compose build          # 3-5 минут (собирает debian+asterisk и python3.12+pipecat)
+docker compose build
+# 5-7 минут:
+#   - bot image: python:3.12-slim + pipecat-ai 1.0 + deps (~400 MB)
+#   - asterisk image: ubuntu:22.04 + asterisk 18 (ru-mirror яндекса)
 
 ================================================================================
   ШАГ 6. Запуск
 ================================================================================
 
 docker compose up -d
-docker compose ps             # два контейнера должны быть "running"
+docker compose ps              # оба "running"
 
-# Логи — в двух терминалах параллельно или через tmux
+# Ждём 5-10 сек и смотрим стартовые логи:
+docker compose logs bot --tail=20
+# нужна строка: "AudioSocket server listening on 0.0.0.0:4444"
+
+docker compose logs asterisk --tail=50 | grep -E "(Endpoint|Registered|Reachable)"
+# ожидаем:
+#   Endpoint uis-endpoint is now Reachable
+#   Contact uis-aor/sip:... is now Reachable
+
+================================================================================
+  ШАГ 7. Проверка SIP-регистрации UIS
+================================================================================
+
+./scripts/check-trunk.sh
+
+Ждём:
+  === PJSIP registrations ===
+  uis-reg/sip:pbx.uiscom.ru   uis-auth   Registered
+
+  === PJSIP endpoints ===
+  uis-endpoint                             Not in use
+  Contact uis-aor/sip:pbx.uiscom.ru   Avail   RTT < 100ms
+
+Если статус Rejected:
+  - неверный логин/пароль в .env → исправь и docker compose restart asterisk
+  - IP VPS не в whitelist UIS → добавь в ЛК UIS
+
+================================================================================
+  ШАГ 8. Sanity-check прокси + внешних API
+================================================================================
+
+# Прокси живой?
+docker compose exec bot curl -sS -o /dev/null -w "проxy HTTP %{http_code}\n" \
+  --max-time 10 https://httpbin.org/ip
+# ожидаем HTTP 200 (и в теле будет IP твоего прокси, а не РФ IP VPS)
+
+# OpenAI?
+docker compose exec bot bash -c 'curl -sS -o /dev/null -w "OpenAI HTTP %{http_code}\n" \
+  --max-time 10 https://api.openai.com/v1/models \
+  -H "Authorization: Bearer $OPENAI_API_KEY"'
+# ожидаем HTTP 200
+
+# ElevenLabs?
+docker compose exec bot bash -c 'curl -sS -o /dev/null -w "ElevenLabs HTTP %{http_code}\n" \
+  --max-time 10 https://api.elevenlabs.io/v1/voices \
+  -H "xi-api-key: $ELEVENLABS_API_KEY"'
+# ожидаем HTTP 200
+
+# Deepgram?
+docker compose exec bot bash -c 'curl -sS -o /dev/null -w "Deepgram HTTP %{http_code}\n" \
+  --max-time 10 https://api.deepgram.com/v1/projects \
+  -H "Authorization: Token $DEEPGRAM_API_KEY"'
+# ожидаем HTTP 200
+
+Если HTTP 000 / timeout → прокси не работает (неверный USER:PASS, порт,
+или прокси не поддерживает CONNECT). Проверь:
+  docker compose exec bot bash -c 'echo $HTTPS_PROXY'
+
+================================================================================
+  ШАГ 9. Тестовый звонок на свой мобильный
+================================================================================
+
+# Терминал 1 — логи бота
+docker compose logs -f bot
+
+# Терминал 2 — логи Asterisk (SIP-сигналинг)
 docker compose logs -f asterisk
-docker compose logs -f bot
 
-================================================================================
-  ШАГ 7. Проверка регистрации SIP-транка
-================================================================================
-
-# После запуска подожди 5-10 секунд — Asterisk зарегистрируется на UIS.
-make status
-# или
-docker compose exec asterisk asterisk -rx "pjsip show registrations"
-
-# Должно показать:
-#  <Registration/ServerURI..................>  <Auth..........>  <Status.......>
-#  uis-reg/sip:sip.uiscom.ru                  uis-auth          Registered
-
-# Если Status = Rejected → пароль/логин неверны. Проверь .env, restart:
-docker compose restart asterisk
-
-# Если Status = Unregistered → сеть, фаервол, UIS заблокировал IP.
-# Посмотри SIP-трафик:
-docker compose exec asterisk tcpdump -i any -n port 5060
-
-================================================================================
-  ШАГ 8. Тестовый звонок на свой мобильный
-================================================================================
-
-# Открой в одном окне логи бота:
-docker compose logs -f bot
-
-# В другом окне запусти звонок:
-make originate NUM=79XXXXXXXXX
-# или
+# Терминал 3 — звонок (формат: 7XXXXXXXXXX, без плюса)
 ./scripts/originate.sh 79XXXXXXXXX
 
-# Что должно произойти:
-#  1. Asterisk звонит на твой мобильный через UIS
-#  2. Ты снимаешь трубку
-#  3. Asterisk подключает канал к боту через AudioSocket
-#  4. Бот говорит голосом из ElevenLabs:
-#     "Алло, здравствуйте! Это Анна, компания ВЕктра..."
-#  5. Ты отвечаешь, Deepgram распознаёт, OpenAI формирует реплику,
-#     ElevenLabs озвучивает
-#  6. После логического завершения диалога Анна прощается
+Что должно произойти:
+  1. Asterisk отправит INVITE в UIS (→ Called 7...@uis-endpoint)
+  2. UIS ответит progress + ring → твой мобильный зазвонит
+  3. Снимаешь трубку → Asterisk: AudioSocket(UUID,127.0.0.1:4444)
+  4. Бот: "AudioSocket connection from ... Starting pipeline"
+  5. Анна по голосу ElevenLabs:
+     "Алло, здравствуйте! Это Анна, компания ВЕктра..."
+  6. Отвечаешь — Deepgram распознаёт (streaming) → OpenAI отвечает →
+     ElevenLabs озвучивает, и так по кругу до финальной реплики.
 
 ================================================================================
-  ОТЛАДКА — что смотреть при проблемах
+  ОТЛАДКА
 ================================================================================
 
-Не регистрируется в UIS:
-  docker compose exec asterisk asterisk -rx "pjsip show transports"
-  docker compose exec asterisk asterisk -rx "pjsip show aor uis-aor"
-  # SIP-трафик:
-  tcpdump -i any -n port 5060 -A
-  # UIS может требовать привязку IP в ЛК — проверь белый список.
+A. Asterisk не регается в UIS:
+   docker compose exec asterisk asterisk -rx "pjsip show registrations"
+   docker compose exec asterisk asterisk -rx "pjsip show transports"
+   - Rejected → user/pass неверны
+   - Unregistered → сеть/фаервол/whitelist UIS
 
-Звонок идёт, но бот молчит:
-  docker compose logs bot
-  # Ищи ошибки импорта Pipecat 1.0 — если API поменялся, правь bot.py
-  # Проверь что AudioSocket TCP :4444 слушается:
-  ss -tlnp | grep 4444
+B. UIS: "Регион ВН запрещает использование SIP":
+   - IP твоего VPS не РФ. Пересаживайся на РФ-провайдера.
 
-Бот говорит, но клиента не слышит:
-  # VAD или ресемплинг 8→16 кГц сломан. Посмотри в логах
-  # DeepgramSTTService сообщения о полученном аудио.
+C. Бот крашится при старте:
+   docker compose logs bot
+   - Чаще всего: нет одного из API-ключей
+   - ModuleNotFoundError → API Pipecat 1.x слегка разошёлся → сообщай,
+     поправим (пока сверено на pipecat-ai 1.0.0)
 
-OpenAI 401/403:
-  # Ключ битый или заблокирован регион. Перейди на proxyapi.
+D. Прокси не отвечает:
+   docker compose exec bot curl -v -x $HTTPS_PROXY https://api.openai.com/v1/models
+   - 407 Proxy Authentication Required → USER:PASS неверны
+   - timeout → HOST:PORT неверны / прокси не работает
+   - если в USER/PASS есть спецсимволы (@/:) — URL-encode их:
+       @ → %40   : → %3A   / → %2F
 
-ElevenLabs 401/invalid voice:
-  # Voice ID не совпадает с твоим аккаунтом, или модель eleven_v3
-  # недоступна — в .env переключи ELEVENLABS_MODEL=eleven_multilingual_v2.
+E. "making progress" но звонок до клиента не доходит:
+   - в ЛК UIS: баланс, CALLERID, разрешены ли исходящие
+   - не тот UIS_CALLER_ID в .env → поправь + restart
+   - номер куда звоним в неподдерживаемом регионе UIS
 
-Плохое качество голоса, булькает:
-  # Падает сеть между VPS и UIS / между VPS и ElevenLabs.
-  # Для ElevenLabs streaming критична латентность < 200 мс.
+F. Звук идёт, но булькает / прерывается:
+   - RTT до UIS (check-trunk.sh) должен быть < 100ms
+   - docker compose exec bot ping -c 3 <proxy-host> — < 200ms
+   - если больше 300ms — смени прокси на ближе к РФ (Финляндия, Германия)
+
+G. Бот слышит, но отвечает с задержкой > 2 сек:
+   - Проверь `docker compose logs bot | grep -i latency`
+   - Основные задержки: OpenAI first-token ~500мс, ElevenLabs TTS ~300мс
+   - Если сильно больше — проблема в прокси
 
 ================================================================================
-  МАССОВЫЙ ОБЗВОН (следующий шаг после MVP)
-================================================================================
-
-Для обзвона базы номеров:
-  - Либо просто цикл: for n in $(cat numbers.txt); do make originate NUM=$n; sleep 5; done
-  - Либо ставим Vicidial поверх того же Asterisk
-  - Либо пишем собственный диалер с AMI (asterisk-ami-py) и контролем
-    одновременных линий (UIS обычно даёт 5-20 одновременных каналов)
-
-================================================================================
-  ОБНОВЛЕНИЕ
+  ОБНОВЛЕНИЕ РЕПО
 ================================================================================
 
 cd /opt/voice-bot-vectra
@@ -210,15 +273,25 @@ docker compose build
 docker compose up -d
 
 ================================================================================
-  ЧТО НЕ СВЕРЕНО И МОЖЕТ ТРЕБОВАТЬ ПОДПРАВКИ НА МЕСТЕ
+  МАССОВЫЙ ОБЗВОН (следующий шаг после MVP)
 ================================================================================
 
-1. Пути импортов BaseInputTransport/BaseOutputTransport в Pipecat 1.0 взяты по аналогии с
-   0.0.x. Если ImportError — смотри docs.pipecat.ai/server/transports/.
-2. Модель gpt-4.1-mini (OpenAI docs недоступны на момент сверки, 403) —
-   если OpenAI вернёт 404 на эту модель, используй gpt-4o-mini.
-3. В Asterisk 20 протокол AudioSocket жёстко 8 кГц slin (тип 0x10).
-   Если поднимешь Asterisk 22+, можно переключить транспорт на 16 кГц (0x12)
-   и убрать ресемплинг в audiosocket.py.
+Когда single-call работает стабильно:
+  - простой цикл:
+      while read n; do ./scripts/originate.sh "$n"; sleep 8; done < numbers.txt
+  - либо Vicidial поверх того же Asterisk
+  - либо собственный диалер через AMI с контролем одновременных каналов
+    (UIS обычно даёт 5-20 одновременных SIP-каналов на тарифе)
+
+================================================================================
+  БЕЗОПАСНОСТЬ
+================================================================================
+
+  - .env содержит секреты; он в .gitignore, в репу не коммитится.
+  - При смене прокси/ключей → nano .env + docker compose restart bot.
+  - Если твой proxy USER:PASS утёк (лог, screenshot и т.п.) — ротируй у
+    поставщика прокси и меняй в .env.
+  - SIP-пароль UIS не должен попадать в логи Asterisk в продакшене
+    (поставь level=notice в logger.conf).
 
 ================================================================================
