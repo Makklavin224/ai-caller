@@ -1,0 +1,16 @@
+services:
+  asterisk:
+    build: ./asterisk
+    container_name: vectra-asterisk
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - bot
+
+  bot:
+    build: ./bot
+    container_name: vectra-bot
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped

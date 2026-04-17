@@ -1,0 +1,11 @@
+.env
+*.pyc
+__pycache__/
+.venv/
+*.log
+asterisk/etc/pjsip.conf
+.DS_Store
+.omc/
+.claude/
+.idea/
+.vscode/

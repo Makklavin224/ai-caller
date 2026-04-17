@@ -1,0 +1,4 @@
+pipecat-ai[openai,elevenlabs,deepgram,silero]>=0.0.55
+pydantic-settings>=2.0
+loguru>=0.7
+python-dotenv>=1.0
