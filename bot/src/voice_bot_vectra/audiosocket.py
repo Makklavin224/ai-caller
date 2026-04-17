@@ -138,7 +138,8 @@ class AudioSocketOutput(BaseOutputTransport):
     never hears choppy playback — at most they get a short silence.
     """
 
-    BUFFER_MAX = 50  # 50 × 20ms = 1s max look-ahead
+    BUFFER_MAX = 50       # 50 × 20 ms = 1 s max look-ahead
+    PREFILL_TARGET = 5    # accumulate 100 ms before first real output
 
     def __init__(self, writer: asyncio.StreamWriter, params: TransportParams):
         super().__init__(params)
@@ -148,6 +149,7 @@ class AudioSocketOutput(BaseOutputTransport):
         self._sender_task: asyncio.Task | None = None
         self._frame_counter = 0
         self._underruns = 0
+        self._prefilled = False
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -201,7 +203,12 @@ class AudioSocketOutput(BaseOutputTransport):
         return True
 
     async def _sender_loop(self):
-        """Tick out one 20 ms slin8 frame every 20 ms. Fill underruns with silence."""
+        """Tick out one 20 ms slin8 frame every 20 ms. Fill underruns with silence.
+
+        Prefill phase: emit silence while waiting for PREFILL_TARGET chunks to
+        accumulate. This gives the queue headroom so downstream jitter doesn't
+        immediately underrun once we start pulling real audio.
+        """
         INTERVAL = 0.020
         SILENCE = b"\x00" * CHUNK_8K_20MS
         next_tick = time.monotonic()
@@ -213,13 +220,29 @@ class AudioSocketOutput(BaseOutputTransport):
                     await asyncio.sleep(sleep_s)
                 next_tick += INTERVAL
 
-                try:
-                    chunk = self._chunk_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    chunk = SILENCE
-                    self._underruns += 1
-                    if self._underruns % 50 == 1:
-                        logger.warning(f"AudioSocket underrun (sent silence, total={self._underruns})")
+                if not self._prefilled:
+                    if self._chunk_queue.qsize() >= self.PREFILL_TARGET:
+                        self._prefilled = True
+                        logger.info(
+                            f"AudioSocketOutput prefilled "
+                            f"({self.PREFILL_TARGET} chunks), starting playback"
+                        )
+                        chunk = self._chunk_queue.get_nowait()
+                    else:
+                        chunk = SILENCE
+                else:
+                    try:
+                        chunk = self._chunk_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        chunk = SILENCE
+                        self._underruns += 1
+                        # Re-enter prefill to rebuild headroom before next pop
+                        self._prefilled = False
+                        if self._underruns % 50 == 1:
+                            logger.warning(
+                                f"AudioSocket underrun (silence, total={self._underruns}, "
+                                f"q={self._chunk_queue.qsize()})"
+                            )
 
                 try:
                     self._writer.write(encode_message(TYPE_AUDIO_8K, chunk))

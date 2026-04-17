@@ -34,6 +34,7 @@ async def run_bot(
         audio_out_enabled=True,
         audio_in_sample_rate=16000,
         audio_out_sample_rate=16000,
+        audio_out_10ms_chunks=2,  # 20 ms per frame → matches AudioSocket wire rate
     )
     transport = AudioSocketTransport(reader, writer, params)
 
