@@ -46,9 +46,15 @@ def encode_message(msg_type: int, payload: bytes) -> bytes:
 
 
 class AudioSocketInput(BaseInputTransport):
-    def __init__(self, reader: asyncio.StreamReader, params: TransportParams):
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        params: TransportParams,
+    ):
         super().__init__(params)
         self._reader = reader
+        self._writer = writer
         self._read_task: asyncio.Task | None = None
         self._rs_state = None  # audioop.ratecv continuity state
 
@@ -114,6 +120,11 @@ class AudioSocketInput(BaseInputTransport):
         except Exception:
             logger.exception("AudioSocket read loop failed")
         finally:
+            try:
+                if not self._writer.is_closing():
+                    self._writer.close()
+            except Exception:
+                pass
             await self.push_frame(EndFrame())
 
 
@@ -132,6 +143,8 @@ class AudioSocketOutput(BaseOutputTransport):
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         if not frame.audio:
             return True
+        if self._writer.is_closing():
+            return False
         self._frame_counter += 1
         if self._frame_counter <= 3:
             logger.info(
@@ -173,7 +186,7 @@ class AudioSocketTransport(BaseTransport):
 
     def input(self) -> AudioSocketInput:
         if self._input is None:
-            self._input = AudioSocketInput(self._reader, self._params)
+            self._input = AudioSocketInput(self._reader, self._writer, self._params)
         return self._input
 
     def output(self) -> AudioSocketOutput:
