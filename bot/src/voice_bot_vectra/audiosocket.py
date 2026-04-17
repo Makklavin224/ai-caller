@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import struct
+import time
 
 from loguru import logger
 from pipecat.frames.frames import CancelFrame, EndFrame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame
@@ -134,6 +135,7 @@ class AudioSocketOutput(BaseOutputTransport):
         self._writer = writer
         self._rs_state = None
         self._frame_counter = 0
+        self._last_write_mono: float | None = None
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -146,6 +148,16 @@ class AudioSocketOutput(BaseOutputTransport):
         if self._writer.is_closing():
             return False
         self._frame_counter += 1
+        now = time.monotonic()
+        if self._last_write_mono is not None:
+            dt_ms = (now - self._last_write_mono) * 1000.0
+            # Frame is ~40ms (1280B @ 16kHz); flag gaps > 70ms
+            if dt_ms > 70:
+                logger.warning(
+                    f"audio-gap: {dt_ms:.0f}ms before frame #{self._frame_counter} "
+                    f"({len(frame.audio)}B)"
+                )
+        self._last_write_mono = now
         if self._frame_counter <= 3:
             logger.info(
                 f"write_audio_frame #{self._frame_counter}: "
