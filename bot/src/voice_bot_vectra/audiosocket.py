@@ -54,6 +54,7 @@ class AudioSocketInput(BaseInputTransport):
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
+        await self.set_transport_ready(frame)
         if self._read_task is None:
             self._read_task = asyncio.create_task(self._receive())
 
