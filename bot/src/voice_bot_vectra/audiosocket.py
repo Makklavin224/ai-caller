@@ -122,12 +122,12 @@ class AudioSocketOutput(BaseOutputTransport):
         self._writer = writer
         self._rs_state = None
 
-    async def write_raw_audio_frames(self, frames: bytes):
-        if not frames:
-            return
+    async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+        if not frame.audio:
+            return True
         try:
             down, self._rs_state = audioop.ratecv(
-                frames, 2, 1, PIPE_RATE, WIRE_RATE, self._rs_state,
+                frame.audio, 2, 1, PIPE_RATE, WIRE_RATE, self._rs_state,
             )
             for i in range(0, len(down), CHUNK_8K_20MS):
                 chunk = down[i:i + CHUNK_8K_20MS]
@@ -135,8 +135,13 @@ class AudioSocketOutput(BaseOutputTransport):
                     chunk = chunk + b"\x00" * (CHUNK_8K_20MS - len(chunk))
                 self._writer.write(encode_message(TYPE_AUDIO_8K, chunk))
             await self._writer.drain()
+            return True
         except (ConnectionResetError, BrokenPipeError):
             logger.info("AudioSocket: write failed, peer gone")
+            return False
+
+    async def register_audio_destination(self, destination):
+        return None
 
 
 class AudioSocketTransport(BaseTransport):
