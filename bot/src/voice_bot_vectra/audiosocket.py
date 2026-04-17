@@ -146,7 +146,8 @@ class AudioSocketTransport(BaseTransport):
         writer: asyncio.StreamWriter,
         params: TransportParams,
     ):
-        super().__init__(params=params)
+        super().__init__()
+        self._params = params
         self._reader = reader
         self._writer = writer
         self._input: AudioSocketInput | None = None
