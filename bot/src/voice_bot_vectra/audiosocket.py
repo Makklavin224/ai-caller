@@ -121,14 +121,22 @@ class AudioSocketOutput(BaseOutputTransport):
         super().__init__(params)
         self._writer = writer
         self._rs_state = None
+        self._frame_counter = 0
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
         await self.set_transport_ready(frame)
+        logger.info(f"AudioSocketOutput ready: sample_rate={self._sample_rate}")
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         if not frame.audio:
             return True
+        self._frame_counter += 1
+        if self._frame_counter <= 3:
+            logger.info(
+                f"write_audio_frame #{self._frame_counter}: "
+                f"{len(frame.audio)}B sr={frame.sample_rate}"
+            )
         try:
             down, self._rs_state = audioop.ratecv(
                 frame.audio, 2, 1, PIPE_RATE, WIRE_RATE, self._rs_state,
