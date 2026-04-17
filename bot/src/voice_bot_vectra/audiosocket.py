@@ -130,53 +130,107 @@ class AudioSocketInput(BaseInputTransport):
 
 
 class AudioSocketOutput(BaseOutputTransport):
+    """Paced 50 Hz sender with jitter buffer.
+
+    TTS audio arrives from Pipecat in bursts (ElevenLabs WSS over WG can stall
+    150-300 ms). We buffer 20 ms chunks and tick one out every 20 ms of wall
+    time. Gaps in TTS delivery are filled with slin silence so the caller
+    never hears choppy playback — at most they get a short silence.
+    """
+
+    BUFFER_MAX = 50  # 50 × 20ms = 1s max look-ahead
+
     def __init__(self, writer: asyncio.StreamWriter, params: TransportParams):
         super().__init__(params)
         self._writer = writer
         self._rs_state = None
+        self._chunk_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=self.BUFFER_MAX)
+        self._sender_task: asyncio.Task | None = None
         self._frame_counter = 0
-        self._last_write_mono: float | None = None
+        self._underruns = 0
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
         await self.set_transport_ready(frame)
+        if self._sender_task is None:
+            self._sender_task = asyncio.create_task(self._sender_loop())
         logger.info(f"AudioSocketOutput ready: sample_rate={self._sample_rate}")
 
+    async def stop(self, frame: EndFrame):
+        await super().stop(frame)
+        await self._cancel_sender()
+
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        await self._cancel_sender()
+
+    async def _cancel_sender(self):
+        if self._sender_task and not self._sender_task.done():
+            self._sender_task.cancel()
+            try:
+                await self._sender_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._sender_task = None
+
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
-        if not frame.audio:
-            return True
-        if self._writer.is_closing():
-            return False
+        if not frame.audio or self._writer.is_closing():
+            return not self._writer.is_closing()
         self._frame_counter += 1
-        now = time.monotonic()
-        if self._last_write_mono is not None:
-            dt_ms = (now - self._last_write_mono) * 1000.0
-            # Frame is ~40ms (1280B @ 16kHz); flag gaps > 70ms
-            if dt_ms > 70:
-                logger.warning(
-                    f"audio-gap: {dt_ms:.0f}ms before frame #{self._frame_counter} "
-                    f"({len(frame.audio)}B)"
-                )
-        self._last_write_mono = now
         if self._frame_counter <= 3:
             logger.info(
                 f"write_audio_frame #{self._frame_counter}: "
                 f"{len(frame.audio)}B sr={frame.sample_rate}"
             )
+        down, self._rs_state = audioop.ratecv(
+            frame.audio, 2, 1, PIPE_RATE, WIRE_RATE, self._rs_state,
+        )
+        for i in range(0, len(down), CHUNK_8K_20MS):
+            chunk = down[i:i + CHUNK_8K_20MS]
+            if len(chunk) < CHUNK_8K_20MS:
+                chunk = chunk + b"\x00" * (CHUNK_8K_20MS - len(chunk))
+            try:
+                self._chunk_queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                # Upstream delivering faster than we can play; drop oldest.
+                try:
+                    self._chunk_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                self._chunk_queue.put_nowait(chunk)
+        return True
+
+    async def _sender_loop(self):
+        """Tick out one 20 ms slin8 frame every 20 ms. Fill underruns with silence."""
+        INTERVAL = 0.020
+        SILENCE = b"\x00" * CHUNK_8K_20MS
+        next_tick = time.monotonic()
         try:
-            down, self._rs_state = audioop.ratecv(
-                frame.audio, 2, 1, PIPE_RATE, WIRE_RATE, self._rs_state,
-            )
-            for i in range(0, len(down), CHUNK_8K_20MS):
-                chunk = down[i:i + CHUNK_8K_20MS]
-                if len(chunk) < CHUNK_8K_20MS:
-                    chunk = chunk + b"\x00" * (CHUNK_8K_20MS - len(chunk))
-                self._writer.write(encode_message(TYPE_AUDIO_8K, chunk))
-            await self._writer.drain()
-            return True
-        except (ConnectionResetError, BrokenPipeError):
-            logger.info("AudioSocket: write failed, peer gone")
-            return False
+            while not self._writer.is_closing():
+                now = time.monotonic()
+                sleep_s = next_tick - now
+                if sleep_s > 0:
+                    await asyncio.sleep(sleep_s)
+                next_tick += INTERVAL
+
+                try:
+                    chunk = self._chunk_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    chunk = SILENCE
+                    self._underruns += 1
+                    if self._underruns % 50 == 1:
+                        logger.warning(f"AudioSocket underrun (sent silence, total={self._underruns})")
+
+                try:
+                    self._writer.write(encode_message(TYPE_AUDIO_8K, chunk))
+                    await self._writer.drain()
+                except (ConnectionResetError, BrokenPipeError):
+                    logger.info("AudioSocket: write failed, peer gone")
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("AudioSocket sender loop failed")
 
     async def register_audio_destination(self, destination):
         return None
