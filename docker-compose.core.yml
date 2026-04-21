@@ -1,0 +1,19 @@
+services:
+  asterisk:
+    build: ./asterisk
+    container_name: ai-caller-core-asterisk
+    env_file: .env.eu
+    environment:
+      ASTERISK_PJSIP_TEMPLATE: /etc/asterisk-template/pjsip.core.conf.template
+      ASTERISK_EXTENSIONS_TEMPLATE: /etc/asterisk-template/extensions.core.conf
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - bot
+
+  bot:
+    build: ./bot
+    container_name: ai-caller-core-bot
+    env_file: .env.eu
+    network_mode: host
+    restart: unless-stopped

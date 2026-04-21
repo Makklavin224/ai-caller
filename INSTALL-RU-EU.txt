@@ -1,0 +1,702 @@
+================================================================================
+  ai-caller — INSTALL для схемы RU Edge + EU Core (Ubuntu 22.04)
+  Разделяем SIP (RU) и media/AI (EU), чтобы убрать рванку и большие лаги
+================================================================================
+
+ВАЖНО
+-----
+Этот документ описывает ЦЕЛЕВУЮ боевую схему из двух серверов:
+
+  1. RU Edge — только SIP-доступ к UIS с разрешенного РФ IP
+  2. EU Core — Asterisk media/core + Pipecat bot + AudioSocket + AI API
+
+Текущий репозиторий ai-caller из коробки собран как all-in-one:
+  - один Asterisk
+  - один bot
+  - один docker-compose.yml
+
+Поэтому этот INSTALL нужен как пошаговый runbook:
+  - поднять новую архитектуру руками
+  - проверить сетевую связность
+  - после этого уже доработать репозиторий под split deployment
+
+================================================================================
+  0. Цель схемы
+================================================================================
+
+Проблема текущей схемы:
+  - Asterisk в РФ
+  - bot / Pipecat / Deepgram / OpenAI / ElevenLabs ходят через VPN/прокси
+  - realtime audio начинает рваться при jitter / bursts / queue buildup
+
+Что делаем:
+  - RU Edge держит только SIP-транк к UIS
+  - EU Core держит media и AI
+  - RTP и bot logic больше не завязаны на офисный WireGuard
+
+Целевая логика вызова:
+
+  Outbound:
+    EU Core инициирует вызов
+      -> SIP до RU Edge
+      -> RU Edge звонит через UIS
+      -> после ответа вызов попадает в bot flow на EU Core
+
+  Inbound:
+    UIS
+      -> RU Edge
+      -> SIP до EU Core
+      -> EU Core отвечает AudioSocket -> bot
+
+RU Edge — это "точка выхода в UIS"
+EU Core — это "мозг и media hub"
+
+================================================================================
+  1. Какие серверы нужны
+================================================================================
+
+1. RU Edge VPS
+   - обязательно публичный РФ IP, реально разрешенный в UIS
+   - 1-2 vCPU
+   - 1-2 GB RAM
+   - 10-20 GB SSD
+   - задача: SIP only
+
+2. EU Core VPS
+   - Германия предпочтительно: Frankfurt / близкая DE локация
+   - 2-4 vCPU
+   - 4 GB RAM минимум
+   - 20+ GB SSD
+   - задача: Asterisk media + bot + AI
+
+Почему так:
+  - RU нужен только из-за ограничений UIS
+  - EU нужен, чтобы быть близко к OpenAI / Deepgram / ElevenLabs
+
+================================================================================
+  2. Что подготовить заранее
+================================================================================
+
+Собери эти данные до старта:
+
+1. RU server
+   - RU_PUBLIC_IP
+
+2. EU server
+   - EU_PUBLIC_IP
+
+3. UIS SIP
+   - UIS_SIP_HOST
+   - UIS_SIP_USER
+   - UIS_SIP_PASSWORD
+   - UIS_CALLER_ID
+
+4. AI API
+   - OPENAI_API_KEY
+   - OPENAI_MODEL
+   - ELEVENLABS_API_KEY
+   - ELEVENLABS_VOICE_ID
+   - ELEVENLABS_MODEL
+   - DEEPGRAM_API_KEY
+
+5. Security
+   - SSH key на оба сервера
+   - сильные пароли или только key auth
+
+================================================================================
+  3. Порты и firewall
+================================================================================
+
+RU Edge:
+  - 22/tcp        SSH
+  - 5060/udp      SIP
+  - 10000-10100/udp RTP
+
+EU Core:
+  - 22/tcp        SSH
+  - 5060/udp      SIP между RU и EU / отладка
+  - 10000-10100/udp RTP
+  - 4444/tcp      AudioSocket (лучше ограничить только локально или между контейнерами)
+
+Если есть cloud firewall, добавь правила и там, и в UFW.
+
+================================================================================
+  4. Базовая подготовка обоих серверов
+================================================================================
+
+На ОБОИХ серверах:
+
+```bash
+ssh root@SERVER_IP
+
+apt update && apt upgrade -y
+apt install -y curl git make vim jq tcpdump ca-certificates ufw
+
+timedatectl set-timezone Europe/Moscow
+
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 5060/udp
+ufw allow 10000:10100/udp
+ufw --force enable
+ufw status
+```
+
+Установка Docker:
+
+```bash
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+docker --version
+docker compose version
+```
+
+================================================================================
+  5. Поднимаем EU Core
+================================================================================
+
+SSH:
+
+```bash
+ssh root@EU_PUBLIC_IP
+```
+
+Клонируем repo:
+
+```bash
+cd /opt
+git clone https://github.com/Makklavin224/ai-caller.git ai-caller
+cd ai-caller
+cp .env.core.example .env.eu
+```
+
+Заполняем `.env.eu`:
+
+```dotenv
+# --- SIP до RU Edge
+RU_EDGE_IP=replace-with-ru-ip
+
+# --- Placeholder UIS values (нужны только потому что текущий entrypoint
+# проверяет переменные UIS_* при старте контейнера)
+UIS_SIP_HOST=pbx.uiscom.ru
+UIS_SIP_USER=placeholder
+UIS_SIP_PASSWORD=placeholder
+UIS_CALLER_ID=74951234567
+
+# --- OpenAI
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+
+# --- ElevenLabs
+ELEVENLABS_API_KEY=...
+ELEVENLABS_VOICE_ID=...
+
+# ВАЖНО:
+# Если хочешь минимальную latency, потом надо переходить на flash-модель.
+# Если хочешь максимум качества и оставляешь eleven_v3 — старт ответа будет медленнее.
+ELEVENLABS_MODEL=eleven_v3
+
+# --- Deepgram
+DEEPGRAM_API_KEY=...
+
+# --- AudioSocket
+AUDIOSOCKET_HOST=0.0.0.0
+AUDIOSOCKET_PORT=4444
+
+LOG_LEVEL=INFO
+```
+
+На EU Core HTTP(S) proxy не нужен, если провайдер нормально ходит в эти API.
+Если доступ без ограничений — оставь `HTTP_PROXY/HTTPS_PROXY` пустыми.
+
+--------------------------------------------------------------------------------
+  5.1. Что будет жить на EU Core
+--------------------------------------------------------------------------------
+
+На EU Core должны жить:
+  - bot container
+  - Asterisk, который управляет media/bot flow
+  - AudioSocket listener на 4444
+
+Текущий репозиторий уже умеет:
+  - поднимать bot
+  - поднимать Asterisk
+  - подключать AudioSocket() к bot
+
+Но текущий `extensions.conf` и `pjsip.conf.template` заточены под один UIS trunk.
+Для split deployment нужно будет сделать отдельные конфиги для EU Core.
+
+Ниже — целевые шаблоны.
+
+--------------------------------------------------------------------------------
+  5.2. Целевой pjsip.conf на EU Core
+--------------------------------------------------------------------------------
+
+Идея:
+  - endpoint `ru-edge`
+  - no registration to UIS from EU
+  - EU принимает вызовы от RU
+  - EU отправляет вызовы на RU
+
+Пример:
+
+```ini
+[global]
+type=global
+user_agent=AICaller-Core/1.0
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5060
+
+[ru-edge]
+type=endpoint
+transport=transport-udp
+context=from-ru
+disallow=all
+allow=alaw
+allow=ulaw
+allow=slin16
+aors=ru-edge
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[ru-edge]
+type=aor
+contact=sip:RU_PUBLIC_IP:5060
+
+[ru-identify]
+type=identify
+endpoint=ru-edge
+match=RU_PUBLIC_IP
+```
+
+Пояснение:
+  - `direct_media=no` на старте безопаснее
+  - сначала добиваемся стабильного разговора
+  - direct media / rtpengine можно включать потом осознанно
+
+--------------------------------------------------------------------------------
+  5.3. Целевой extensions.conf на EU Core
+--------------------------------------------------------------------------------
+
+```asterisk
+[globals]
+BOT_HOST=127.0.0.1
+BOT_PORT=4444
+
+[outbound-via-ru]
+exten => _X.,1,NoOp(Outbound via RU Edge to ${EXTEN})
+ same => n,Dial(PJSIP/${EXTEN}@ru-edge,60)
+ same => n,Hangup()
+
+[from-ru]
+exten => _X.,1,NoOp(Call from RU Edge to ${EXTEN})
+ same => n,Answer()
+ same => n,Set(UUID=${SHELL(uuidgen | tr -d '\n')})
+ same => n,AudioSocket(${UUID},${BOT_HOST}:${BOT_PORT})
+ same => n,Hangup()
+
+[outbound-bot]
+exten => s,1,NoOp(Outbound bot call answered)
+ same => n,Answer()
+ same => n,Set(UUID=${SHELL(uuidgen | tr -d '\n')})
+ same => n,AudioSocket(${UUID},${BOT_HOST}:${BOT_PORT})
+ same => n,Hangup()
+```
+
+Как это работает:
+  - исходящий номер набирается с EU
+  - EU шлет вызов на RU
+  - RU уже вызывает UIS
+  - после ответа звонок возвращается в bot flow
+
+================================================================================
+  6. Поднимаем RU Edge
+================================================================================
+
+SSH:
+
+```bash
+ssh root@RU_PUBLIC_IP
+```
+
+Клонируем repo:
+
+```bash
+cd /opt
+git clone https://github.com/Makklavin224/ai-caller.git ai-caller
+cd ai-caller
+cp .env.edge.example .env.ru
+```
+
+Заполняем `.env.ru`:
+
+```dotenv
+UIS_SIP_HOST=pbx.uiscom.ru
+UIS_SIP_USER=replace-me
+UIS_SIP_PASSWORD=replace-me
+UIS_CALLER_ID=74951234567
+EU_CORE_IP=replace-with-eu-ip
+```
+
+На RU Edge НЕ нужны:
+  - OPENAI_API_KEY
+  - ELEVENLABS_API_KEY
+  - DEEPGRAM_API_KEY
+  - HTTP_PROXY
+  - HTTPS_PROXY
+
+Потому что RU Edge не должен ходить в AI API.
+
+--------------------------------------------------------------------------------
+  6.1. Целевой pjsip.conf на RU Edge
+--------------------------------------------------------------------------------
+
+```ini
+[global]
+type=global
+user_agent=AICaller-Edge/1.0
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5060
+
+[uis-reg]
+type=registration
+transport=transport-udp
+outbound_auth=uis-auth
+server_uri=sip:${UIS_SIP_HOST}
+client_uri=sip:${UIS_SIP_USER}@${UIS_SIP_HOST}
+contact_user=${UIS_SIP_USER}
+retry_interval=60
+expiration=300
+
+[uis-auth]
+type=auth
+auth_type=userpass
+username=${UIS_SIP_USER}
+password=${UIS_SIP_PASSWORD}
+
+[uis-aor]
+type=aor
+contact=sip:${UIS_SIP_HOST}
+qualify_frequency=60
+
+[uis-endpoint]
+type=endpoint
+transport=transport-udp
+context=from-uis
+disallow=all
+allow=alaw
+allow=ulaw
+allow=slin16
+aors=uis-aor
+outbound_auth=uis-auth
+from_user=${UIS_SIP_USER}
+from_domain=${UIS_SIP_HOST}
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[uis-identify]
+type=identify
+endpoint=uis-endpoint
+match=${UIS_SIP_HOST}
+
+[eu-core]
+type=endpoint
+transport=transport-udp
+context=from-eu
+disallow=all
+allow=alaw
+allow=ulaw
+allow=slin16
+aors=eu-core
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[eu-core]
+type=aor
+contact=sip:EU_PUBLIC_IP:5060
+
+[eu-identify]
+type=identify
+endpoint=eu-core
+match=EU_PUBLIC_IP
+```
+
+--------------------------------------------------------------------------------
+  6.2. Целевой extensions.conf на RU Edge
+--------------------------------------------------------------------------------
+
+```asterisk
+[from-eu]
+exten => _X.,1,NoOp(Outbound from EU Core to UIS: ${EXTEN})
+ same => n,Dial(PJSIP/${EXTEN}@uis-endpoint,60)
+ same => n,Hangup()
+
+[from-uis]
+exten => _X.,1,NoOp(Inbound from UIS -> pass to EU Core)
+ same => n,Dial(PJSIP/${EXTEN}@eu-core,60)
+ same => n,Hangup()
+```
+
+Идея:
+  - RU не держит bot
+  - RU не делает AudioSocket
+  - RU просто переводит SIP между UIS и EU Core
+
+================================================================================
+  7. Как запускать на старте
+================================================================================
+
+На старте проще идти так:
+
+1. RU Edge
+   - поднять только Asterisk
+   - проверить регистрацию в UIS
+
+2. EU Core
+   - поднять Asterisk
+   - поднять bot
+   - проверить AudioSocket listener
+
+Поскольку текущий `docker-compose.yml` all-in-one, на старте для новой схемы
+лучше использовать либо:
+  - отдельные override compose-файлы
+  - либо временно запускать сервисы по отдельности
+
+Минимальная цель сейчас:
+  - RU: один контейнер Asterisk
+  - EU: Asterisk + bot
+
+Команды запуска:
+
+RU Edge:
+
+```bash
+docker compose -f docker-compose.edge.yml --env-file .env.ru build
+docker compose -f docker-compose.edge.yml --env-file .env.ru up -d
+```
+
+EU Core:
+
+```bash
+docker compose -f docker-compose.core.yml --env-file .env.eu build
+docker compose -f docker-compose.core.yml --env-file .env.eu up -d
+```
+
+================================================================================
+  8. Проверки после запуска
+================================================================================
+
+--------------------------------------------------------------------------------
+  8.1. Проверка RU Edge
+--------------------------------------------------------------------------------
+
+На RU:
+
+```bash
+docker compose -f docker-compose.edge.yml --env-file .env.ru exec asterisk asterisk -rx "pjsip show registrations"
+docker compose -f docker-compose.edge.yml --env-file .env.ru exec asterisk asterisk -rx "pjsip show endpoints"
+```
+
+Нужно увидеть:
+  - `uis-reg` -> Registered
+  - endpoint UIS reachable
+
+Если `Rejected`:
+  - неверный логин/пароль
+  - RU IP не разрешен в UIS
+
+--------------------------------------------------------------------------------
+  8.2. Проверка EU Core
+--------------------------------------------------------------------------------
+
+На EU:
+
+```bash
+docker compose -f docker-compose.core.yml --env-file .env.eu logs bot --tail=50
+```
+
+Нужно увидеть:
+
+```text
+AudioSocket server listening on 0.0.0.0:4444
+```
+
+Проверка API:
+
+```bash
+docker compose -f docker-compose.core.yml --env-file .env.eu exec bot python -c "
+import os, httpx
+r = httpx.get(
+  'https://api.openai.com/v1/models',
+  headers={'Authorization': f'Bearer {os.environ[\"OPENAI_API_KEY\"]}'},
+  timeout=10
+)
+print('OpenAI ->', r.status_code)
+"
+```
+
+```bash
+docker compose -f docker-compose.core.yml --env-file .env.eu exec bot python -c "
+import os, httpx
+r = httpx.get(
+  'https://api.deepgram.com/v1/projects',
+  headers={'Authorization': f'Token {os.environ[\"DEEPGRAM_API_KEY\"]}'},
+  timeout=10
+)
+print('Deepgram ->', r.status_code)
+"
+```
+
+```bash
+docker compose -f docker-compose.core.yml --env-file .env.eu exec bot python -c "
+import os, httpx
+r = httpx.get(
+  'https://api.elevenlabs.io/v1/voices',
+  headers={'xi-api-key': os.environ['ELEVENLABS_API_KEY']},
+  timeout=10
+)
+print('ElevenLabs ->', r.status_code)
+"
+```
+
+Ожидаем HTTP 200.
+
+================================================================================
+  9. Первый тестовый звонок
+================================================================================
+
+Логика теста:
+
+1. На EU инициируем outbound вызов
+2. EU вызывает RU
+3. RU звонит через UIS
+4. После ответа звонок обрабатывает bot на EU
+
+Тест делай на свой мобильный:
+
+```text
+79XXXXXXXXX
+```
+
+Во время теста:
+
+На RU:
+
+```bash
+docker compose -f docker-compose.edge.yml --env-file .env.ru logs -f asterisk
+```
+
+На EU:
+
+```bash
+docker compose -f docker-compose.core.yml --env-file .env.eu logs -f asterisk
+docker compose -f docker-compose.core.yml --env-file .env.eu logs -f bot
+```
+
+Что должно быть:
+  - RU показывает вызов в UIS
+  - EU показывает вход вызова в bot flow
+  - bot пишет `AudioSocket connection from ...`
+  - начинается первая фраза
+
+================================================================================
+  10. Что пока НЕ делать
+================================================================================
+
+1. Не гонять RTP через офисный WireGuard
+2. Не держать AI API на RU Edge
+3. Не пытаться сначала "допилить latency" параметрами TTS, пока архитектура не разделена
+4. Не включать `direct_media=yes` сразу на обоих узлах без tcpdump и логов
+
+Сначала:
+  - стабильно заводим split SIP/media
+  - потом уже уменьшаем latency
+
+================================================================================
+  11. Что дальше после первого стабильного звонка
+================================================================================
+
+Когда split-схема заработала и звук перестал рваться, делаем второй этап:
+
+1. Дорабатываем репозиторий под два deploy targets:
+   - `docker-compose.edge.yml`
+   - `docker-compose.core.yml`
+
+2. Выносим отдельные Asterisk templates:
+   - `pjsip.edge.conf.template`
+   - `pjsip.core.conf.template`
+   - `extensions.edge.conf`
+   - `extensions.core.conf`
+
+3. Добавляем метрики latency:
+   - first STT partial
+   - first final transcript
+   - first LLM token
+   - first TTS byte
+   - first audio frame out
+
+4. Делаем более умный realtime pipeline:
+   - interruption support
+   - partial-response strategy
+   - контроль длинных ответов
+
+================================================================================
+  12. Отдельное важное замечание по ElevenLabs
+================================================================================
+
+Сейчас в репозитории bot использует `ElevenLabsTTSService` из Pipecat, то есть
+streaming realtime integration.
+
+По официальной документации ElevenLabs:
+  - WebSocket streaming TTS есть
+  - но `eleven_v3` не является самым низколатентным realtime режимом
+  - для минимальной latency используется `eleven_flash_v2_5`
+
+Поэтому:
+  - если приоритет = "максимально красивый голос", оставляй `eleven_v3`
+  - если приоритет = "самый быстрый первый байт аудио", потом делай отдельный
+    A/B тест с `eleven_flash_v2_5`
+
+На первом этапе цель не в этом.
+На первом этапе цель:
+  - убрать рванку
+  - убрать зависимость аудио от РФ VPN path
+  - сделать стабильный разговор
+
+================================================================================
+  TL;DR
+================================================================================
+
+RU Edge:
+  - новый РФ сервер
+  - только UIS SIP trunk
+  - только Asterisk
+  - никаких AI сервисов
+
+EU Core:
+  - новый EU сервер
+  - Asterisk + bot + AudioSocket
+  - OpenAI / Deepgram / ElevenLabs
+  - весь bot flow живет здесь
+
+Порядок:
+  1. поднимаем RU Edge
+  2. поднимаем EU Core
+  3. проверяем UIS registration на RU
+  4. проверяем bot / API на EU
+  5. делаем первый звонок
+  6. после этого дорабатываем репозиторий под split deployment

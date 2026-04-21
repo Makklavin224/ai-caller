@@ -1,0 +1,10 @@
+services:
+  asterisk:
+    build: ./asterisk
+    container_name: ai-caller-edge-asterisk
+    env_file: .env.ru
+    environment:
+      ASTERISK_PJSIP_TEMPLATE: /etc/asterisk-template/pjsip.edge.conf.template
+      ASTERISK_EXTENSIONS_TEMPLATE: /etc/asterisk-template/extensions.edge.conf
+    network_mode: host
+    restart: unless-stopped
